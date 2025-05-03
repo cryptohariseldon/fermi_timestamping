@@ -1,0 +1,12 @@
+[package]
+name = "rt_ping"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+roughenough = { version = "1.3.0-draft13" }   # RFC-draft-13 + Google “classic” client/server
+hex         = "0.4"
+# tiny error-handling helper
+anyhow      = "1"
+# for pretty-printing the timestamp
+chrono      = { version = "0.4", default-features = false, features = ["clock"] }
