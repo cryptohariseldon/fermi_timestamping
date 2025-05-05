@@ -50,7 +50,7 @@ pub enum TimestampError {
 // Constants & helpers
 
 const DEFAULT_HOSTS: [&str; 2] = [
-    "roughtime.int08h.com:2002",
+    "roughtime.cloudflare.com:2003",
     "time.cloudflare.com:2003",
 ];
 
