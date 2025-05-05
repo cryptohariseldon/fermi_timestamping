@@ -1,172 +1,214 @@
-//! fermi_roughtime – minimal wrapper around two public Roughtime servers
-//! to obtain a latency‑adjusted, median‑filtered UTC timestamp.
-//!
-//! ## Usage
-//! ```rust
-//! use fermi_roughtime::get_timestamp;
-//!
-//! fn main() -> anyhow::Result<()> {
-//!     let ts = get_timestamp(0xdead_beef)?;
-//!     println!("{}", serde_json::to_string_pretty(&ts)?);
-//!     Ok(())
-//! }
-//! ```
+//! rt_timestamp 0.2 – latency-adjusted Roughtime querier.
 
-use base64::{engine::general_purpose as b64, Engine as _};
-use chrono::{DateTime, Duration, TimeZone, Utc};
-use roughtime::{error::Error as RoughtimeError, Client};
-use serde::Serialize;
-use std::time::Instant;
-use thiserror::Error;
+use chrono::{DateTime, Local, Utc};
+use roughenough::{merkle::MerkleTree, RtMessage, Tag};
+use std::{
+    convert::TryInto,
+    net::UdpSocket,
+    sync::{Arc, Barrier},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
 
-/// Roughtime endpoint definitions – feel free to replace / expand.
-const CLOUDFLARE_ADDR: &str = "roughtime.cloudflare.com:2003";
-/// Base64‑encoded long‑term root public key published by Cloudflare.
-const CLOUDFLARE_PUBKEY_B64: &str = "0GD7c3yP8xEc4Zl2zeuN2SlLvDVVocjsPSL8/Rl/7zg="; // ([developers.cloudflare.com](https://developers.cloudflare.com/time-services/roughtime/usage/?utm_source=chatgpt.com))
+// -------------------------------------------------------------------------
+// Public structs
 
-const INT08H_ADDR: &str = "roughtime.int08h.com:2002";
-/// Base64‑encoded public key from DNS TXT record of roughtime.int08h.com.
-const INT08H_PUBKEY_B64: &str = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="; // ([github.com](https://github.com/int08h/roughenough?utm_source=chatgpt.com))
-
-/// Metadata returned alongside the final timestamp.
-#[derive(Debug, Serialize)]
-pub struct Metadata {
-    /// Round‑trip times (ms) for each queried server.
-    pub rtt_ms: [u128; 2],
-    /// Raw midpoints (server‑supplied UTC time) before latency adjustment.
-    pub midpoint_utc: [DateTime<Utc>; 2],
-    /// Claimed uncertainty radii (µs) from each server.
-    pub radius_us: [u32; 2],
-    /// Clock drift between the two latency‑adjusted estimates (ms).
-    pub drift_ms: i128,
-}
-
-/// Result returned by [`get_timestamp`].
-#[derive(Debug, Serialize)]
-pub struct TimestampResult {
-    /// User‑supplied 32‑bit hash (opaque context value).
-    pub input_hash: u32,
-    /// Median latency‑adjusted timestamp (UTC).
-    pub timestamp: DateTime<Utc>,
-    /// Rich diagnostic metadata.
+#[derive(Debug, serde::Serialize)]
+pub struct TimestampResponse {
+    pub input_hash: String,
+    pub timestamp: u64,        // median true-time (µs since epoch)
     pub metadata: Metadata,
 }
 
-/// Errors bubbled up by the crate.
-#[derive(Debug, Error)]
-pub enum TimeSyncError {
-    #[error("failed to query roughtime server: {0}")]
-    Roughtime(#[from] RoughtimeError),
-    #[error("io error: {0}")]
+#[derive(Debug, serde::Serialize)]
+pub struct Metadata {
+    pub beacons: [BeaconMeta; 2],
+    pub drift_us: u64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct BeaconMeta {
+    pub host: String,
+    pub rtt_ms: f64,
+    pub true_time: SystemTime,
+    pub offset_us: i128,
+    pub uncert_us: i128,
+    pub radius_us: u32,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TimestampError {
+    #[error("IO: {0}")]
     Io(#[from] std::io::Error),
-    #[error("asynchronous runtime failure: {0}")]
-    Tokio(#[from] tokio::task::JoinError),
+    #[error("Thread panic")]
+    Join,
+    #[error("All probes failed")]
+    NoProbes,
 }
 
-/// Internal async helper – queries a single Roughtime server and reports
-/// `(rtt_µs, midpoint_utc, radius_µs)`.
-async fn query_server(addr: &str, pubkey_b64: &str) -> Result<(u128, DateTime<Utc>, u32), RoughtimeError> {
-    // Decode B64‑encoded 32‑byte root key.
-    let pubkey = b64::STANDARD
-        .decode(pubkey_b64)
-        .expect("invalid base64 public key");
-    let mut client = Client::new(addr, pubkey);
+// -------------------------------------------------------------------------
+// Constants & helpers
 
-    let t0 = Instant::now();
-    let reply = client.get().await?;
-    let rtt_µs = t0.elapsed().as_micros();
+const DEFAULT_HOSTS: [&str; 2] = [
+    "roughtime.int08h.com:2002",
+    "time.cloudflare.com:2003",
+];
 
-    // Roughtime midpoints are µs since Unix epoch.
-    let midpoint_utc = Utc.timestamp_opt(
-        (reply.midpoint() / 1_000_000) as i64,
-        ((reply.midpoint() % 1_000_000) as u32) * 1_000,
-    )
-    .single()
-    .expect("midpoint out of range");
-
-    Ok((rtt_µs, midpoint_utc, reply.radius() as u32))
+#[inline]
+fn pad_nonce(hash: [u8; 32]) -> Vec<u8> {
+    let mut v = hash.to_vec();
+    v.resize(64, 0);
+    v
 }
 
-/// Query two Roughtime servers and return a latency‑adjusted median timestamp.
-///
-/// * `input_hash` – an opaque 32‑bit value you wish to bind to the query (e.g. the
-///   BLAKE3 hash prefix of an order‑placement payload).
-///
-/// # Algorithm
-/// 1. Fetch time from Cloudflare and int08h servers in parallel.
-/// 2. For each, subtract half the measured round‑trip time to compensate for
-///    network delay.
-/// 3. Take the median (here: mean, since n=2) of the two adjusted values.
-/// 4. Expose rich metadata so higher‑level components can audit / threshold.
-///
-/// The function is **blocking** (spins up a private Tokio runtime). If you are
-/// already in an async context, call the internal `async_get_timestamp` instead.
-pub fn get_timestamp(input_hash: u32) -> Result<TimestampResult, TimeSyncError> {
-    // Spin up a lightweight runtime – cost ~2 µs after initial warm‑up.
-    let rt = tokio::runtime::Runtime::new()?;
+#[inline]
+fn rt_to_io(e: roughenough::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))
+}
 
-    rt.block_on(async move {
-        let (s1, s2) = tokio::try_join!(
-            query_server(CLOUDFLARE_ADDR, CLOUDFLARE_PUBKEY_B64),
-            query_server(INT08H_ADDR, INT08H_PUBKEY_B64)
-        )?;
+#[inline]
+fn sys_to_us(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
 
-        let (rtt1, mid1, rad1) = s1;
-        let (rtt2, mid2, rad2) = s2;
+// -------------------------------------------------------------------------
+// Public API
 
-        // Latency‑adjusted: assume symmetric delay → subtract half RTT.
-        let adj1 = mid1 - Duration::microseconds((rtt1 / 2) as i64);
-        let adj2 = mid2 - Duration::microseconds((rtt2 / 2) as i64);
+pub fn get_timestamp(hash: [u8; 32]) -> Result<TimestampResponse, TimestampError> {
+    get_timestamp_custom(hash, &DEFAULT_HOSTS)
+}
 
-        // Median (n=2 => mean).
-        let ts = adj1 + (adj2 - adj1) / 2;
-        let drift_ms = (adj1 - adj2).num_milliseconds();
+pub fn get_timestamp_custom(
+    hash: [u8; 32],
+    hosts: &[&str; 2],
+) -> Result<TimestampResponse, TimestampError> {
+    let nonce = Arc::new(pad_nonce(hash));
+    let gate  = Arc::new(Barrier::new(3));            // 2 workers + main
 
-        Ok(TimestampResult {
-            input_hash,
-            timestamp: ts,
-            metadata: Metadata {
-                rtt_ms: [(rtt1 / 1_000) as u128, (rtt2 / 1_000) as u128],
-                midpoint_utc: [mid1, mid2],
-                radius_us: [rad1, rad2],
-                drift_ms,
-            },
-        })
+    let h1 = spawn_probe(hosts[0].into(), nonce.clone(), gate.clone());
+    let h2 = spawn_probe(hosts[1].into(), nonce.clone(), gate.clone());
+
+    gate.wait();                                      // launch simultaneously
+
+    let p1 = h1.join().map_err(|_| TimestampError::Join)??;
+    let p2 = h2.join().map_err(|_| TimestampError::Join)??;
+
+    // median-of-2 (earlier true_time wins)
+    let (median_st, _) = if p1.true_time <= p2.true_time {
+        (p1.true_time, p1.clone())
+    } else {
+        (p2.true_time, p2.clone())
+    };
+
+    let drift_us = (p1.offset_us - p2.offset_us).abs() as u64;
+
+    Ok(TimestampResponse {
+        input_hash: hex::encode(hash),
+        timestamp: sys_to_us(median_st),
+        metadata: Metadata {
+            beacons: [p1, p2],
+            drift_us,
+        },
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// -------------------------------------------------------------------------
+// Thread worker
 
-    #[test]
-    fn roundtrip_query() {
-        let res = get_timestamp(0x1234_5678).expect("timestamp query failed");
-        println!("{}", serde_json::to_string_pretty(&res).unwrap());
-        // Basic sanity: drift should be < 10 s.
-        assert!(res.metadata.drift_ms.abs() < 10_000);
-    }
+fn spawn_probe(
+    host: String,
+    nonce: Arc<Vec<u8>>,
+    gate: Arc<Barrier>,
+) -> thread::JoinHandle<Result<BeaconMeta, TimestampError>> {
+    thread::spawn(move || {
+        let packet = build_packet(&nonce)?;
+        let sock   = UdpSocket::bind("0.0.0.0:0")?;
+        sock.set_read_timeout(Some(Duration::from_secs(3)))?;
+
+        gate.wait();
+
+        let t_send_wall = SystemTime::now();
+        let t_send_inst = Instant::now();
+        sock.send_to(&packet, &host)?;
+        let mut buf = [0u8; 4096];
+        let (len, _) = sock.recv_from(&mut buf)?;
+        let rtt = t_send_inst.elapsed();
+
+        parse_reply(&host, &nonce, &buf[..len], t_send_wall, rtt)
+    })
 }
-```
 
-// =========================  README.md  =========================
-// Optional – omit if you prefer, provided here for completeness.
+// -------------------------------------------------------------------------
+// Packet build & parse
 
-/*
-# fermi_roughtime
+fn build_packet(nonce: &[u8]) -> Result<Vec<u8>, TimestampError> {
+    let mut req = RtMessage::with_capacity(2);
+    req.add_field(Tag::NONC, nonce).map_err(rt_to_io)?;
+    req.add_field(Tag::PAD, &[]).map_err(rt_to_io)?;
+    let pad = vec![0u8; req.calculate_padding_length()];
+    req.clear();
+    req.add_field(Tag::NONC, nonce).map_err(rt_to_io)?;
+    req.add_field(Tag::PAD, &pad).map_err(rt_to_io)?;
+    Ok(req.encode().map_err(rt_to_io)?)
+}
 
-Fetch a latency‑compensated median timestamp from two public Roughtime servers
-(Cloudflare + int08h) in a single line of Rust.
+fn parse_reply(
+    host: &str,
+    nonce: &[u8],
+    buf: &[u8],
+    t_send_wall: SystemTime,
+    rtt: Duration,
+) -> Result<BeaconMeta, TimestampError> {
+    let resp = RtMessage::from_bytes(buf).map_err(rt_to_io)?;
+    let srep = RtMessage::from_bytes(resp.get_field(Tag::SREP).unwrap()).map_err(rt_to_io)?;
 
-```rust
-let ts = fermi_roughtime::get_timestamp(0xdead_beef)?;
-println!("{}", serde_json::to_string_pretty(&ts)?);
-```
+    let radius_us =
+        u32::from_le_bytes(srep.get_field(Tag::RADI).unwrap()[..4].try_into().unwrap());
+    let mid_us =
+        u64::from_le_bytes(srep.get_field(Tag::MIDP).unwrap()[..8].try_into().unwrap());
 
-Why dual‑source? Because Roughtime’s security model detects *lying* servers but
-cannot fix an outright *failed* one. Interrogating two independent operators
-and cross‑checking their answers gives you immediate drift diagnostics, letting
-you reject obviously bogus answers in latency‑critical pipelines (e.g. global
-DEX order‑ingress timestamping).
+    // Merkle inclusion proof
+    let idx = u32::from_le_bytes(resp.get_field(Tag::INDX).unwrap()[..4].try_into().unwrap());
+    let path = resp.get_field(Tag::PATH).unwrap();
+    let root = MerkleTree::new_sha512_google().root_from_paths(idx as usize, nonce, path);
+    assert_eq!(root, srep.get_field(Tag::ROOT).unwrap(), "Merkle path invalid");
 
-*/
+    let half_rtt  = Duration::from_micros((rtt.as_micros() / 2) as u64);
+    let true_time = t_send_wall + half_rtt;
+    let mid_wall  = SystemTime::UNIX_EPOCH + Duration::from_micros(mid_us);
+
+    let offset_us = match mid_wall.duration_since(true_time) {
+        Ok(d)  =>  d.as_micros() as i128,
+        Err(e) => -(e.duration().as_micros() as i128),
+    };
+
+    Ok(BeaconMeta {
+        host: host.to_string(),                 // ← fixed line
+        rtt_ms: rtt.as_secs_f64() * 1e3,
+        true_time,
+        offset_us,
+        uncert_us: radius_us as i128 + half_rtt.as_micros() as i128,
+        radius_us,
+    })
+}
+
+// -------------------------------------------------------------------------
+// Pretty-printer for quick manual test (optional)
+
+#[allow(dead_code)]
+fn print(resp: &TimestampResponse) {
+    println!("input hash  : {}", resp.input_hash);
+    println!("timestamp   : {}", resp.timestamp);
+    for (i, b) in resp.metadata.beacons.iter().enumerate() {
+        let dt_utc: DateTime<Utc> = b.true_time.into();
+        let dt_loc: DateTime<Local> = b.true_time.into();
+        println!("-- Beacon {i}  {host}", host = b.host);
+        println!("   RTT          : {:.3} ms", b.rtt_ms);
+        println!("   true-time    : {dt_utc}  (local {dt_loc})");
+        println!("   offset       : {:+} µs", b.offset_us);
+        println!("   uncert       : ±{} µs  (radius + ½ RTT)", b.uncert_us);
+    }
+    println!("drift (adj) : {} µs", resp.metadata.drift_us);
+}

@@ -10,3 +10,5 @@ hex         = "0.4"
 anyhow      = "1"
 # for pretty-printing the timestamp
 chrono      = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
